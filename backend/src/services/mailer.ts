@@ -3,6 +3,15 @@ import { env } from "../config/env";
 
 let transporterPromise: Promise<Transporter> | null = null;
 
+// Bound how long a single send can take, so it always finishes (or fails)
+// well inside STALE_CLAIM_MS. Otherwise a hung send could look like a
+// crashed worker and get taken over by another worker.
+const SMTP_TIMEOUTS = {
+  connectionTimeout: 30_000,
+  greetingTimeout: 30_000,
+  socketTimeout: 60_000,
+};
+
 async function buildTransporter(): Promise<Transporter> {
   if (env.etherealUser && env.etherealPass) {
     return nodemailer.createTransport({
@@ -10,6 +19,7 @@ async function buildTransporter(): Promise<Transporter> {
       port: 587,
       secure: false,
       auth: { user: env.etherealUser, pass: env.etherealPass },
+      ...SMTP_TIMEOUTS,
     });
   }
 
@@ -24,6 +34,7 @@ async function buildTransporter(): Promise<Transporter> {
     port: testAccount.smtp.port,
     secure: testAccount.smtp.secure,
     auth: { user: testAccount.user, pass: testAccount.pass },
+    ...SMTP_TIMEOUTS,
   });
 }
 

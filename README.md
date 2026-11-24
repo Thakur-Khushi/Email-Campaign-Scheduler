@@ -6,6 +6,8 @@ Sending is done through **BullMQ + Redis** delayed jobs (no cron), emails go out
 **Ethereal** (a fake SMTP inbox with preview links), and every recipient is persisted in
 **PostgreSQL** so nothing is lost across a server/worker restart.
 
+<!-- TODO: add demo GIF here -->
+
 ## Stack
 
 - Backend: Express + TypeScript, Prisma ORM, PostgreSQL, BullMQ + Redis, Passport (Google OAuth),
@@ -75,6 +77,8 @@ cp .env.example .env
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | ✅ | from step 2 |
 | `GOOGLE_CALLBACK_URL` | — | must exactly match the redirect URI registered in Google Cloud |
 | `WORKER_CONCURRENCY` | — | how many BullMQ jobs the worker processes at once, default `5` |
+| `STALE_CLAIM_MS` | — | how long (ms) a `PROCESSING` claim is honoured before another worker may take it over, default `300000` (5 min) |
+| `MAX_RECIPIENTS` | — | maximum recipients per campaign, default `5000` |
 | `ETHEREAL_USER` / `ETHEREAL_PASS` | — | optional, see step 3 |
 
 Also create `frontend/.env`:
@@ -88,7 +92,7 @@ VITE_API_URL=http://localhost:4000
 ```bash
 cd backend
 npm install
-npm run prisma:migrate    # creates the User / Campaign / EmailRecipient tables
+npm run prisma:migrate    # applies all migrations (User / Campaign / EmailRecipient tables)
 cd ../frontend
 npm install
 ```
@@ -111,6 +115,17 @@ npm run worker
 
 `npm run dev` uses `ts-node-dev` with `--respawn`, so both restart automatically on file changes.
 For a production-style run: `npm run build` then `npm start` / `npm run start:worker`.
+
+## Running tests
+
+```bash
+cd backend
+npm test
+```
+
+Unit tests (Vitest) cover the send-slot scheduler (`services/scheduler.ts`) and the recipient
+file parser (`services/recipientParser.ts`). They're pure functions, so no Postgres or Redis is
+needed.
 
 ## 7. Running the frontend
 
@@ -160,7 +175,7 @@ later) instead of failing — the limit is enforced via an atomic Redis counter
 flowchart TD
     A[User schedules emails] --> B[Express API]
     B --> C[(PostgreSQL: Campaign + EmailRecipient rows)]
-    B --> D[BullMQ: one delayed job per recipient, jobId = recipient row id]
+    B --> D[BullMQ: one delayed job per recipient, jobId = rowId-w windowIndex]
     D --> E[(Redis: job queue + rate-limit counters)]
     E --> F[Worker: claims row, checks Redis hourly counter]
     F --> G[Nodemailer -> Ethereal SMTP]
@@ -189,17 +204,35 @@ the right time, no polling or cron involved.
 ### How persistence on restart is handled
 
 - Every recipient's data (subject/body/recipient/status/times) lives in **Postgres**, not memory.
-- Every pending send is a **delayed job already sitting in Redis** (BullMQ), not something
-  scheduled by a running `setTimeout` in the API process.
-- Restarting the API only affects HTTP requests being served that instant — it owns none of the
-  scheduling state. Restarting the worker just means BullMQ resumes handing it due jobs from
-  Redis once it reconnects; nothing was lost because nothing was held only in that process's
-  memory.
-- Idempotency on top of that durability: before sending, the worker does an atomic
-  `UPDATE EmailRecipient SET status='PROCESSING' WHERE id=? AND status='SCHEDULED'`. If a job
-  fires twice for any reason (crash mid-send + BullMQ retry, a duplicate add, etc.), whichever
-  attempt loses that compare-and-swap sees 0 rows affected and skips — the recipient's own status
-  column is the real duplicate-send guard, not just the BullMQ `jobId`.
+  A campaign and all of its recipient rows are written in **one transaction**, so a campaign is
+  never half-created.
+- Every pending send is a **delayed job in Redis** (BullMQ), not a `setTimeout` in the API
+  process. Restarting the API only affects HTTP requests being served that instant; restarting
+  the worker just means BullMQ resumes handing it due jobs once it reconnects.
+- **Deterministic job ids**: each job's id is `<recipientId>-w<windowIndex>` (see
+  `emailJobId()` in `queues/emailQueue.ts`). Campaign creation, rate-limit deferral and the
+  reconcile pass all derive it from the row's current state, so re-adding a job that's already
+  queued is a no-op. A job whose id doesn't match its row's current window is obsolete and is
+  skipped.
+- **Atomic claim**: before sending, the worker does a compare-and-swap
+  (`updateMany ... WHERE id=? AND (status='SCHEDULED' OR (status='PROCESSING' AND claimedAt is
+  stale))`) that sets `status='PROCESSING'` and `claimedAt=now`. Whichever attempt loses sees 0
+  rows affected and doesn't send. `SENT` and `FAILED` rows never match, so they are never
+  re-sent. `claimedAt` is cleared when a row moves to `SENT`, `FAILED` or back to `SCHEDULED`.
+- **Stale-claim takeover**: if a worker crashes after claiming a row but before marking it
+  `SENT`, the row is left `PROCESSING`. A claim older than `STALE_CLAIM_MS` (default 5 min) is
+  considered abandoned and can be claimed again. When BullMQ re-runs the stalled job before the
+  claim has gone stale, the worker doesn't drop it. It moves the job back to delayed until the
+  claim expires, then re-checks. SMTP timeouts in `services/mailer.ts` keep a single send well
+  under that window, so a slow (but alive) send isn't mistaken for a crash.
+- **Startup reconcile pass**: the API commits rows to Postgres and then enqueues jobs. If Redis
+  is down or the API dies in between, the request still returns `201` (with a `warning`), and the
+  rows sit in `SCHEDULED` with no job. Every time the worker starts, before it processes anything,
+  `reconcilePendingJobs()` (`services/reconcile.ts`) scans all `SCHEDULED` rows plus `PROCESSING`
+  rows with a stale claim, in batches of 500. It re-adds any job that's missing, or that Redis
+  still lists as completed/failed even though the row was never sent, and logs how many it
+  re-enqueued. Orphaned rows are only picked up on the next worker start. There is no periodic
+  sweep while the worker is running.
 
 ### How rate limiting & concurrency are implemented
 
@@ -227,6 +260,11 @@ the right time, no polling or cron involved.
 - ✅ Persistence across restarts: Postgres for data, Redis for pending jobs
   (`prisma/schema.prisma`)
 - ✅ Idempotency / duplicate-send prevention via atomic DB compare-and-swap
+- ✅ Crash recovery: stale-claim takeover for rows stuck in `PROCESSING`, plus a startup reconcile
+  pass that re-enqueues rows with no job behind them (`services/reconcile.ts`)
+- ✅ Server-side campaign validation: recipient re-validation/dedupe, `MAX_RECIPIENTS` cap,
+  subject/body length limits, start time not in the past, bounded delay and hourly limit
+- ✅ Unit tests for the scheduler and recipient parser (`npm test`)
 - ✅ Hourly rate limiting via an atomic Redis counter, with overflow deferred (not dropped) to
   the next hour window, preserving delay spacing (`services/rateLimiter.ts`)
 - ✅ Configurable worker concurrency via `WORKER_CONCURRENCY`
@@ -248,8 +286,3 @@ the right time, no polling or cron involved.
 ## Environment variables
 
 See [.env.example](./.env.example) for the full list, or the table in step 4 above.
-
-## Repository access
-
-This is a private repository shared with `Mitrajit` and `Yadav036` per the assignment
-requirements.

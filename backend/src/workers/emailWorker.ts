@@ -1,13 +1,20 @@
-import { Job, Worker } from "bullmq";
+import { DelayedError, Job, Worker } from "bullmq";
 import { createRedisConnection } from "../config/redis";
 import { env } from "../config/env";
 import { prisma } from "../database/prisma";
-import { EMAIL_QUEUE_NAME, EmailJobData, emailQueue } from "../queues/emailQueue";
+import {
+  EMAIL_QUEUE_NAME,
+  EmailJobData,
+  emailJobId,
+  enqueueEmailJob,
+  ensureEmailJob,
+} from "../queues/emailQueue";
 import { tryReserveSlot, nextDeferPosition } from "../services/rateLimiter";
 import { sendEmail } from "../services/mailer";
 import { HOUR_MS } from "../services/scheduler";
+import { claimableWhere, reconcilePendingJobs } from "../services/reconcile";
 
-async function processEmailJob(job: Job<EmailJobData>): Promise<void> {
+async function processEmailJob(job: Job<EmailJobData>, token?: string): Promise<void> {
   const { recipientId } = job.data;
 
   const recipient = await prisma.emailRecipient.findUnique({
@@ -18,15 +25,47 @@ async function processEmailJob(job: Job<EmailJobData>): Promise<void> {
     console.warn(`[worker] Recipient ${recipientId} no longer exists, skipping`);
     return;
   }
+  if (recipient.status === "SENT" || recipient.status === "FAILED") {
+    console.log(`[worker] ${recipientId} already ${recipient.status}, skipping duplicate job`);
+    return;
+  }
 
-  // Atomic claim: only proceed if this row is still SCHEDULED. Covers
-  // idempotency (already SENT/FAILED) and concurrent-worker duplication
-  // (already PROCESSING) in one compare-and-swap.
+  // Only the job matching the row's current window may send it (see
+  // emailJobId). Anything else is obsolete, e.g. a job from before a
+  // deferral. Before dropping it, make sure the current job exists, in case
+  // a deferral updated the row but its enqueue failed.
+  if (job.id !== emailJobId(recipientId, recipient.windowIndex)) {
+    if (recipient.status === "SCHEDULED") {
+      await ensureEmailJob(recipientId, recipient.scheduledAt, recipient.windowIndex);
+    }
+    console.log(`[worker] Job ${job.id} is obsolete for ${recipientId}, skipping`);
+    return;
+  }
+
+  // Atomic claim (compare-and-swap): succeeds if the row is SCHEDULED, or if
+  // it's PROCESSING but the claim is stale (the worker that took it crashed).
+  // SENT/FAILED rows never match, so they're never re-sent.
+  const now = new Date();
   const claim = await prisma.emailRecipient.updateMany({
-    where: { id: recipientId, status: "SCHEDULED" },
-    data: { status: "PROCESSING" },
+    where: { id: recipientId, ...claimableWhere(now) },
+    data: { status: "PROCESSING", claimedAt: now },
   });
   if (claim.count === 0) {
+    const current = await prisma.emailRecipient.findUnique({
+      where: { id: recipientId },
+      select: { status: true, claimedAt: true },
+    });
+    if (current?.status === "PROCESSING" && current.claimedAt && token) {
+      // Someone holds a fresh claim. Usually this is BullMQ re-running a job
+      // whose worker died seconds ago. Don't drop it: come back once the claim
+      // goes stale, and the claim above will take it over if it's still stuck.
+      const retryAt = current.claimedAt.getTime() + env.staleClaimMs + 1000;
+      await job.moveToDelayed(retryAt, token);
+      console.log(
+        `[worker] ${recipientId} is claimed by another attempt, re-checking at ${new Date(retryAt).toISOString()}`
+      );
+      throw new DelayedError();
+    }
     console.log(`[worker] ${recipientId} already handled, skipping duplicate job`);
     return;
   }
@@ -48,23 +87,20 @@ async function processEmailJob(job: Job<EmailJobData>): Promise<void> {
       windowStart + position * recipient.campaign.delayMs
     );
 
+    // DB first, then queue. If the enqueue fails, this job errors and its
+    // retry sees itself as obsolete, which re-creates the new window's job
+    // (see the obsolete-job check above).
     await prisma.emailRecipient.update({
       where: { id: recipientId },
       data: {
         status: "SCHEDULED",
         scheduledAt: newScheduledAt,
         windowIndex: newWindowIndex,
+        claimedAt: null,
       },
     });
 
-    await emailQueue.add(
-      "send-email",
-      { recipientId } as EmailJobData,
-      {
-        jobId: `${recipientId}:w${newWindowIndex}`,
-        delay: Math.max(0, newScheduledAt.getTime() - Date.now()),
-      }
-    );
+    await enqueueEmailJob(recipientId, newScheduledAt, newWindowIndex);
 
     console.log(
       `[worker] Hourly limit reached for campaign ${recipient.campaignId}, deferred ${recipientId} to window ${newWindowIndex}`
@@ -81,7 +117,7 @@ async function processEmailJob(job: Job<EmailJobData>): Promise<void> {
 
     await prisma.emailRecipient.update({
       where: { id: recipientId },
-      data: { status: "SENT", sentAt: new Date(), previewUrl },
+      data: { status: "SENT", sentAt: new Date(), previewUrl, claimedAt: null },
     });
 
     console.log(`[worker] Sent to ${recipient.recipient} (${previewUrl})`);
@@ -92,22 +128,24 @@ async function processEmailJob(job: Job<EmailJobData>): Promise<void> {
     if (isFinalAttempt) {
       await prisma.emailRecipient.update({
         where: { id: recipientId },
-        data: { status: "FAILED", error: (err as Error).message },
+        data: { status: "FAILED", error: (err as Error).message, claimedAt: null },
       });
     } else {
       // Revert the claim so the retry's compare-and-swap can succeed again.
       await prisma.emailRecipient.update({
         where: { id: recipientId },
-        data: { status: "SCHEDULED" },
+        data: { status: "SCHEDULED", claimedAt: null },
       });
     }
     throw err;
   }
 }
 
+// autorun: false so the reconcile pass finishes before any job is processed.
 const worker = new Worker<EmailJobData>(EMAIL_QUEUE_NAME, processEmailJob, {
   connection: createRedisConnection(),
   concurrency: env.workerConcurrency,
+  autorun: false,
 });
 
 worker.on("failed", (job, err) => {
@@ -118,6 +156,22 @@ worker.on("ready", () => {
   console.log(
     `[worker] Listening on "${EMAIL_QUEUE_NAME}" with concurrency=${env.workerConcurrency}`
   );
+});
+
+async function start() {
+  const { scanned, enqueued } = await reconcilePendingJobs();
+  console.log(
+    `[worker] Reconcile: checked ${scanned} pending row(s), re-enqueued ${enqueued} missing job(s)`
+  );
+  worker.run().catch((err) => {
+    console.error("[worker] Worker stopped with an error:", err);
+    process.exit(1);
+  });
+}
+
+start().catch((err) => {
+  console.error("[worker] Startup reconcile failed:", err);
+  process.exit(1);
 });
 
 process.on("SIGTERM", async () => {

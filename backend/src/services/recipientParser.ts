@@ -1,6 +1,6 @@
 import { parse } from "csv-parse/sync";
 
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function extractCandidates(fileContent: string): string[] {
   const trimmed = fileContent.trim();
@@ -11,6 +11,9 @@ function extractCandidates(fileContent: string): string[] {
     const rows: string[][] = parse(trimmed, {
       relax_column_count: true,
       skip_empty_lines: true,
+      // Accept mixed line endings; otherwise csv-parse locks onto the first
+      // one it sees and merges the remaining lines into a single cell.
+      record_delimiter: ["\r\n", "\n", "\r"],
     });
     const candidates: string[] = [];
     for (const row of rows) {

@@ -13,7 +13,8 @@ import emailsRoutes from "./routes/emails.routes";
 export const app = express();
 
 app.use(cors({ origin: env.frontendUrl, credentials: true }));
-app.use(express.json());
+// Raised from the 100kb default so a MAX_RECIPIENTS-sized campaign fits.
+app.use(express.json({ limit: "1mb" }));
 
 app.use(
   session({

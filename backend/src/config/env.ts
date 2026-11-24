@@ -32,6 +32,12 @@ export const env = {
 
   workerConcurrency: parseInt(process.env.WORKER_CONCURRENCY ?? "5", 10),
 
+  // A PROCESSING row whose claimedAt is older than this is treated as
+  // abandoned (worker crashed mid-send) and may be claimed again.
+  staleClaimMs: parseInt(process.env.STALE_CLAIM_MS ?? String(5 * 60 * 1000), 10),
+
+  maxRecipients: parseInt(process.env.MAX_RECIPIENTS ?? "5000", 10),
+
   etherealUser: process.env.ETHEREAL_USER ?? "",
   etherealPass: process.env.ETHEREAL_PASS ?? "",
 };

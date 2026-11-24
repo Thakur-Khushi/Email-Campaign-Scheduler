@@ -45,7 +45,7 @@ if (env.googleClientId && env.googleClientSecret) {
   );
 }
 
-passport.serializeUser((user: any, done) => {
+passport.serializeUser((user: Express.User, done) => {
   done(null, user.id);
 });
 

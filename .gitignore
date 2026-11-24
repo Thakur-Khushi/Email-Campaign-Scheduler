@@ -3,10 +3,16 @@ dist/
 build/
 *.tsbuildinfo
 .env
+.env.*
+!.env.example
 backend/.env
 frontend/.env
 *.log
 .DS_Store
+Thumbs.db
+
+# Test output (vitest --coverage)
+coverage/
 
 # Prisma
 backend/prisma/*.db

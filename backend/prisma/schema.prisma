@@ -52,6 +52,7 @@ model EmailRecipient {
   status      EmailStatus @default(SCHEDULED)
   scheduledAt DateTime
   windowIndex Int
+  claimedAt   DateTime?
   sentAt      DateTime?
   previewUrl  String?
   error       String?

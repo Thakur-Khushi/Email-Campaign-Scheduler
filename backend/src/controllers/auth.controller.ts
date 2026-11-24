@@ -5,7 +5,7 @@ export function getCurrentUser(req: Request, res: Response) {
   if (!req.isAuthenticated || !req.isAuthenticated()) {
     return res.status(401).json({ error: "Not authenticated" });
   }
-  const user = req.user as any;
+  const user = req.user!;
   return res.json({
     id: user.id,
     name: user.name,
