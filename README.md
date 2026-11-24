@@ -1,5 +1,12 @@
 # ReachInbox Scheduler
 
+![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)
+![Express](https://img.shields.io/badge/Express-4.x-000000?logo=express&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Prisma-4169E1?logo=postgresql&logoColor=white)
+![BullMQ](https://img.shields.io/badge/BullMQ-Redis-DC382D?logo=redis&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-Vitest-6E9F18?logo=vitest&logoColor=white)
+
 A full-stack app that lets a Google-authenticated user upload a list of recipients, compose an
 email, and schedule it to go out with a configurable per-email delay and a per-hour send limit.
 Sending is done through **BullMQ + Redis** delayed jobs (no cron), emails go out via
@@ -7,6 +14,50 @@ Sending is done through **BullMQ + Redis** delayed jobs (no cron), emails go out
 **PostgreSQL** so nothing is lost across a server/worker restart.
 
 <!-- TODO: add demo GIF here -->
+
+<!--
+Screenshots: save them in docs/images/ with these names, then uncomment this block.
+
+| Login | Compose | Scheduled | Sent |
+|---|---|---|---|
+| ![Login](docs/images/login.png) | ![Compose](docs/images/compose.png) | ![Scheduled](docs/images/scheduled.png) | ![Sent](docs/images/sent.png) |
+-->
+
+![Architecture: React frontend → Express API → PostgreSQL and Redis/BullMQ → worker → Ethereal SMTP](docs/images/architecture.svg)
+
+## Highlights
+
+- **No cron, no polling**: every email is one delayed BullMQ job that Redis wakes up exactly when
+  it's due.
+- **Survives restarts and crashes**: rows live in Postgres, jobs in Redis. A worker that dies
+  mid-send has its claim taken over after `STALE_CLAIM_MS`, and a startup reconcile pass
+  re-creates any job that never made it into Redis.
+- **Never sends twice**: an atomic compare-and-swap on the row's status is the duplicate-send
+  guard. `SENT` / `FAILED` rows can never be claimed again.
+- **Hourly limit across processes**: enforced with a Redis counter, so it holds with any
+  `WORKER_CONCURRENCY` or number of workers. Overflow rolls into the next hour instead of failing.
+- **Validated on the server**: recipients are re-checked and deduped, with caps on recipients,
+  subject/body length, delay and hourly limit.
+
+## Quick start
+
+Assumes Docker, Node.js and Google OAuth credentials (see [step 2](#2-create-google-oauth-credentials)).
+
+```bash
+docker compose up -d                 # Postgres + Redis
+cp .env.example .env                 # then fill in GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET
+echo "VITE_API_URL=http://localhost:4000" > frontend/.env
+
+cd backend && npm install && npm run prisma:migrate && cd ..
+cd frontend && npm install && cd ..
+
+# then, in three separate terminals:
+cd backend && npm run dev            # API on :4000
+cd backend && npm run worker         # worker
+cd frontend && npm run dev           # UI on :5173
+```
+
+The full step-by-step setup is below.
 
 ## Stack
 
@@ -19,9 +70,26 @@ Sending is done through **BullMQ + Redis** delayed jobs (no cron), emails go out
 
 ```
 reachinbox-scheduler/
-├── backend/    Express API + BullMQ worker (see backend/src)
-├── frontend/   React dashboard (see frontend/src)
-├── docker-compose.yml
+├── backend/
+│   ├── prisma/              schema.prisma + migrations
+│   └── src/
+│       ├── config/          env, Redis, Passport (Google OAuth)
+│       ├── controllers/     auth, campaigns, emails, recipients
+│       ├── queues/          BullMQ queue + job id scheme
+│       ├── routes/          Express routers
+│       ├── services/        scheduler, rate limiter, mailer, recipient parser, reconcile
+│       │   └── __tests__/   Vitest unit tests
+│       ├── types/           Express.User augmentation
+│       ├── workers/         emailWorker.ts (separate process)
+│       ├── app.ts           Express app
+│       └── server.ts        API entry point
+├── frontend/
+│   └── src/
+│       ├── components/      compose form, email lists/detail, sidebar, UI primitives
+│       ├── pages/           Login, Dashboard
+│       └── services/        typed API client
+├── docs/images/             README diagrams
+├── docker-compose.yml       Postgres 16 + Redis 7
 └── .env.example
 ```
 
@@ -29,7 +97,8 @@ reachinbox-scheduler/
 
 ## 1. Prerequisites
 
-- Node.js 18+
+- Node.js 18+ to run the app. **Node 20.19+ (or 22.12+) to run the backend tests**, because
+  Vitest 3 uses Vite 7.
 - PostgreSQL 14+ and Redis 6+ — either:
   - **Docker**: `docker compose up -d` from the repo root, or
   - **Native installs**: Postgres running on `localhost:5432` and Redis on `localhost:6379`
@@ -116,16 +185,21 @@ npm run worker
 `npm run dev` uses `ts-node-dev` with `--respawn`, so both restart automatically on file changes.
 For a production-style run: `npm run build` then `npm start` / `npm run start:worker`.
 
-## Running tests
+On startup the worker logs a reconcile line before it starts processing, e.g.
+`[worker] Reconcile: checked 12 pending row(s), re-enqueued 0 missing job(s)`.
 
-```bash
-cd backend
-npm test
-```
+**Backend scripts** (`cd backend`):
 
-Unit tests (Vitest) cover the send-slot scheduler (`services/scheduler.ts`) and the recipient
-file parser (`services/recipientParser.ts`). They're pure functions, so no Postgres or Redis is
-needed.
+| Script | What it does |
+|---|---|
+| `npm run dev` | API with auto-restart (`ts-node-dev`) |
+| `npm run worker` | BullMQ worker with auto-restart |
+| `npm run build` | compile TypeScript to `dist/` |
+| `npm start` / `npm run start:worker` | run the compiled API / worker |
+| `npm test` | run the Vitest unit tests |
+| `npm run prisma:migrate` | apply migrations (`prisma migrate dev`) |
+| `npm run prisma:generate` | regenerate the Prisma client |
+| `npm run prisma:studio` | browse the database in Prisma Studio |
 
 ## 7. Running the frontend
 
@@ -167,20 +241,96 @@ later) instead of failing — the limit is enforced via an atomic Redis counter
 (`rate:<campaignId>:<windowIndex>`), not an in-process variable, so it stays correct even with
 `WORKER_CONCURRENCY` > 1 or multiple worker processes running.
 
+### Crash-recovery test
+
+1. Schedule a few emails a minute or two out and start the worker.
+2. Kill the worker (Ctrl+C) right as sends are happening, then start it again.
+3. Any row left in `PROCESSING` is picked up again once its claim is older than `STALE_CLAIM_MS`.
+   Set e.g. `STALE_CLAIM_MS=30000` in `.env` to see this quickly. Rows that already reached
+   `SENT` are not sent again.
+
+## 9. Running tests
+
+```bash
+cd backend
+npm test
+```
+
+Unit tests (Vitest) cover the send-slot scheduler (`services/scheduler.ts`) and the recipient
+file parser (`services/recipientParser.ts`). They're pure functions, so no Postgres or Redis is
+needed.
+
+---
+
+## API reference
+
+All `/api/*` routes need a logged-in session (cookie from the Google login) and return `401`
+otherwise.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/auth/google` | start Google OAuth login |
+| `GET` | `/auth/google/callback` | OAuth callback, redirects to `FRONTEND_URL` |
+| `GET` | `/auth/me` | current user (`id`, `name`, `email`, `photoUrl`) |
+| `POST` | `/auth/logout` | end the session |
+| `POST` | `/api/recipients/preview` | multipart `file` (.csv/.txt, max 5 MB) → `{ count, recipients, invalidCount }` |
+| `POST` | `/api/campaigns` | create and schedule a campaign (see below) |
+| `GET` | `/api/emails/scheduled` | your `SCHEDULED` + `PROCESSING` rows (latest 500) |
+| `GET` | `/api/emails/sent` | your `SENT` + `FAILED` rows (latest 500) |
+| `GET` | `/health` | liveness check |
+
+**`POST /api/campaigns`** body:
+
+```json
+{
+  "subject": "Hello",
+  "body": "Plain-text body",
+  "recipients": ["a@example.com", "b@example.com"],
+  "startTime": "2026-11-24T15:00:00.000Z",
+  "delayMs": 2000,
+  "hourlyLimit": 50
+}
+```
+
+Validation (any failure returns `400` with an `error` message):
+
+| Field | Rule |
+|---|---|
+| `recipients` | trimmed, lowercased, deduped and checked against the same email regex as the upload parser. Invalid entries are dropped and counted. At least 1 valid entry, at most `MAX_RECIPIENTS` (default 5000) |
+| `subject` | required, ≤ 200 characters |
+| `body` | required, ≤ 50,000 characters |
+| `startTime` | valid date, no more than 1 minute in the past |
+| `delayMs` | 0 – 3,600,000 (1 hour) |
+| `hourlyLimit` | whole number, 1 – 10,000 |
+
+Response `201`:
+
+```json
+{
+  "campaignId": "…",
+  "scheduled": 2,
+  "invalidSkipped": 0,
+  "firstSendAt": "2026-11-24T15:00:00.000Z",
+  "lastSendAt": "2026-11-24T15:00:02.000Z"
+}
+```
+
+If the rows were saved but the jobs couldn't be queued (e.g. Redis unavailable), it still returns
+`201` with an extra `warning` field. The worker's startup reconcile pass queues those rows later.
+
 ---
 
 ## Architecture overview
 
-```mermaid
-flowchart TD
-    A[User schedules emails] --> B[Express API]
-    B --> C[(PostgreSQL: Campaign + EmailRecipient rows)]
-    B --> D[BullMQ: one delayed job per recipient, jobId = rowId-w windowIndex]
-    D --> E[(Redis: job queue + rate-limit counters)]
-    E --> F[Worker: claims row, checks Redis hourly counter]
-    F --> G[Nodemailer -> Ethereal SMTP]
-    G --> C
-```
+![Architecture diagram](docs/images/architecture.svg)
+
+1. The API validates the request, runs `assignSendSlots()` and saves the campaign plus all
+   recipient rows in **one Postgres transaction**.
+2. It then adds one **delayed BullMQ job** per recipient to Redis.
+3. When a job is due, Redis hands it to the worker (a separate process).
+4. The worker **atomically claims** the row in Postgres.
+5. It checks the per-hour Redis counter, then sends through Ethereal.
+6. It marks the row `SENT` (or `FAILED` after the last retry).
 
 ### How scheduling works
 
@@ -202,6 +352,10 @@ Each recipient becomes one `EmailRecipient` row plus one BullMQ job
 the right time, no polling or cron involved.
 
 ### How persistence on restart is handled
+
+Every recipient row moves through these states:
+
+![EmailRecipient status lifecycle: SCHEDULED → PROCESSING → SENT or FAILED](docs/images/email-lifecycle.svg)
 
 - Every recipient's data (subject/body/recipient/status/times) lives in **Postgres**, not memory.
   A campaign and all of its recipient rows are written in **one transaction**, so a campaign is
@@ -286,3 +440,17 @@ the right time, no polling or cron involved.
 ## Environment variables
 
 See [.env.example](./.env.example) for the full list, or the table in step 4 above.
+
+## Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---|---|
+| Google shows `redirect_uri_mismatch` | `GOOGLE_CALLBACK_URL` must exactly match the redirect URI in Google Cloud (`http://localhost:4000/auth/google/callback`) |
+| Google says "access blocked" / app not verified | add your Google account under **Test users** on the OAuth consent screen |
+| `Missing required environment variable: DATABASE_URL` | create `.env` from `.env.example` (repo root or `backend/`) |
+| `ECONNREFUSED 127.0.0.1:6379` errors in the API/worker logs | Redis isn't running. Start it with `docker compose up -d` (or Memurai on Windows) |
+| Emails stay in **Scheduled** forever | the worker isn't running. Start `npm run worker` in `backend/` |
+| A row is stuck in `PROCESSING` | a worker crashed mid-send. It's taken over automatically once the claim is older than `STALE_CLAIM_MS` (default 5 min) |
+| `npm test` fails to start with a Vite/Node engine error | the tests need Node 20.19+ or 22.12+ |
+| `prisma migrate` can't connect | check `DATABASE_URL` and that Postgres is up on port 5432 |
+| Old Ethereal preview links stop working | set a fixed `ETHEREAL_USER` / `ETHEREAL_PASS` (step 3). Otherwise each worker start creates a new inbox |

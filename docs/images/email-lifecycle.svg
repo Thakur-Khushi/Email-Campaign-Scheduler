@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 340" width="960" height="340" role="img" aria-labelledby="title desc">
+  <title id="title">EmailRecipient status lifecycle</title>
+  <desc id="desc">A row starts SCHEDULED. A worker claims it atomically, moving it to PROCESSING and setting claimedAt. From PROCESSING it becomes SENT on success, FAILED on the final failed attempt, or returns to SCHEDULED for a retry or when the hourly limit defers it to the next window. A PROCESSING claim older than STALE_CLAIM_MS can be taken over by another worker. SENT and FAILED are terminal and are never re-sent.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .state { fill: #f6f8fa; stroke: #8c959f; stroke-width: 1.5; }
+    .active { fill: #fff8c5; stroke: #9a6700; stroke-width: 1.5; }
+    .ok { fill: #dafbe1; stroke: #1a7f37; stroke-width: 1.5; }
+    .bad { fill: #ffebe9; stroke: #cf222e; stroke-width: 1.5; }
+    .name { font: 600 15px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1f2328; }
+    .lbl { font: 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .note { font: 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #59636e; }
+    .edge { stroke: #57606a; stroke-width: 1.6; fill: none; }
+    .head { fill: #57606a; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .state { fill: #161b22; stroke: #6e7681; }
+      .active { fill: #3b2e00; stroke: #d29922; }
+      .ok { fill: #04260f; stroke: #3fb950; }
+      .bad { fill: #3d0a0a; stroke: #f85149; }
+      .name, .lbl { fill: #e6edf3; }
+      .note { fill: #9198a1; }
+      .edge { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path class="head" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+  <rect class="bg" x="0" y="0" width="960" height="340" rx="12"/>
+
+  <!-- States -->
+  <rect class="state" x="40" y="160" width="190" height="70" rx="35"/>
+  <text class="name" x="135" y="200" text-anchor="middle">SCHEDULED</text>
+
+  <rect class="active" x="400" y="160" width="190" height="70" rx="35"/>
+  <text class="name" x="495" y="200" text-anchor="middle">PROCESSING</text>
+
+  <rect class="ok" x="760" y="70" width="160" height="60" rx="30"/>
+  <text class="name" x="840" y="105" text-anchor="middle">SENT</text>
+
+  <rect class="bad" x="760" y="260" width="160" height="60" rx="30"/>
+  <text class="name" x="840" y="295" text-anchor="middle">FAILED</text>
+
+  <!-- SCHEDULED -> PROCESSING -->
+  <line class="edge" x1="230" y1="180" x2="396" y2="180" marker-end="url(#arrow)"/>
+  <text class="lbl" x="313" y="158" text-anchor="middle">atomic claim (CAS)</text>
+  <text class="note" x="313" y="172" text-anchor="middle">claimedAt = now</text>
+
+  <!-- PROCESSING -> SCHEDULED -->
+  <line class="edge" x1="400" y1="212" x2="234" y2="212" marker-end="url(#arrow)"/>
+  <text class="lbl" x="317" y="234" text-anchor="middle">retry, or hourly limit hit</text>
+  <text class="note" x="317" y="250" text-anchor="middle">→ next window, new job id</text>
+  <text class="note" x="317" y="266" text-anchor="middle">claimedAt cleared</text>
+
+  <!-- PROCESSING -> SENT -->
+  <line class="edge" x1="580" y1="175" x2="756" y2="108" marker-end="url(#arrow)"/>
+  <text class="lbl" x="655" y="122" text-anchor="middle">sent ok</text>
+
+  <!-- PROCESSING -> FAILED -->
+  <line class="edge" x1="580" y1="215" x2="756" y2="282" marker-end="url(#arrow)"/>
+  <text class="lbl" x="640" y="275" text-anchor="middle">final attempt</text>
+  <text class="lbl" x="640" y="291" text-anchor="middle">failed</text>
+
+  <!-- PROCESSING self-loop: stale takeover -->
+  <path class="edge" d="M450,160 C450,80 540,80 540,156" marker-end="url(#arrow)"/>
+  <text class="lbl" x="495" y="58" text-anchor="middle">worker crashed: claim older than STALE_CLAIM_MS</text>
+  <text class="note" x="495" y="74" text-anchor="middle">→ another worker takes it over</text>
+
+  <!-- Terminal note -->
+  <text class="note" x="840" y="160" text-anchor="middle">terminal: never</text>
+  <text class="note" x="840" y="176" text-anchor="middle">claimed or sent again</text>
+  <text class="note" x="840" y="240" text-anchor="middle">terminal</text>
+
+  <!-- Entry -->
+  <circle class="head" cx="135" cy="95" r="7"/>
+  <line class="edge" x1="135" y1="102" x2="135" y2="156" marker-end="url(#arrow)"/>
+  <text class="note" x="147" y="132">campaign created</text>
+</svg>
